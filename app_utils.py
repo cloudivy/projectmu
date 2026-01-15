@@ -1,220 +1,157 @@
-# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import timedelta
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import io
+import matplotlib.pyplot as plt
+import seaborn as sns
+from io import BytesIO
+import tempfile
 
-# Page config
 st.set_page_config(
-    page_title="Pipeline Pilferage Detection",
+    page_title="Pipeline Digging vs Leak Events",
     page_icon="🛢️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-st.title("🛢️ Pipeline Pilferage Detection Dashboard")
-st.markdown("---")
+st.title("🛢️ Pipeline Digging vs Leak Events Analyzer")
+st.markdown("Upload your PIDWS digging alarms and LDS leak data to visualize correlations by chainage with customizable tolerance.")
 
-# File upload
+# Sidebar controls
+st.sidebar.header("📊 Parameters")
+tolerance = st.sidebar.slider("Chainage Tolerance (km)", 0.1, 10.0, 5.0, 0.1)
+unique_chainages_option = st.sidebar.radio(
+    "Chainage Selection",
+    ["All unique chainages", "Specific chainage", "Top chainages by events"]
+)
+if unique_chainages_option == "Specific chainage":
+    specific_chainage = st.sidebar.number_input("Enter chainage value", value=0.0)
+if unique_chainages_option == "Top chainages by events":
+    top_n = st.sidebar.slider("Top N chainages", 1, 20, 5)
+
+# File uploaders
 col1, col2 = st.columns(2)
 with col1:
-    pidws_file = st.file_uploader("Upload PIDWS data (df_pidws_III.xlsx)", type=['xlsx'])
+    digging_file = st.file_uploader("Upload Manual Digging Data (CSV/Excel)", type=['csv', 'xlsx'], key="digging")
 with col2:
-    lds_file = st.file_uploader("Upload LDS data (df_lds_III.xlsx)", type=['xlsx'])
+    leaks_file = st.file_uploader("Upload LDS Leak Data (CSV/Excel)", type=['csv', 'xlsx'], key="leaks")
 
-if pidws_file is not None and lds_file is not None:
+if digging_file is not None and leaks_file is not None:
     # Load data
     @st.cache_data
-    def load_data(pidws_buffer, lds_buffer):
-        df_pidws = pd.read_excel(pidws_buffer)
-        df_lds = pd.read_excel(lds_buffer)
-        return df_pidws, df_lds
-    
-    df_pidws, df_lds = load_data(pidws_file, lds_file)
-    
-    st.success(f"✅ Loaded {len(df_pidws)} PIDWS records and {len(df_lds)} LDS records")
-    
-    # Sidebar controls
-    st.sidebar.header("📊 Analysis Parameters")
-    chainage_tol = st.sidebar.slider("Chainage Tolerance (km)", 0.1, 2.0, 0.5, 0.1)
-    time_window_hours = st.sidebar.slider("Time Window (hours)", 12, 72, 48, 6)
-    
-    # Parse functions (same as original)
-    @st.cache_data
-    def parse_pidws(df):
-        df = df.copy()
-        df['DateTime'] = pd.to_datetime(df['Date'] + ' ' + df['Time'], format='%d-%m-%Y %H:%M:%S')
+    def load_data(digging_file, leaks_file):
+        if digging_file.name.endswith('.csv'):
+            df_manual_digging = pd.read_csv(digging_file)
+        else:
+            df_manual_digging = pd.read_excel(digging_file)
         
-        def parse_duration(dur_str):
-            if pd.isna(dur_str):
-                return pd.Timedelta(0)
-            dur_str = str(dur_str).strip().lower().replace(' ', '')
-            mins, secs = 0, 0
-            if 'm' in dur_str:
-                m_part = dur_str.split('m')[0]
-                if m_part.isdigit():
-                    mins = int(m_part)
-                dur_str = dur_str.split('m')[1]
-            if 's' in dur_str:
-                s_part = dur_str.replace('s', '')
-                if s_part.isdigit():
-                    secs = int(s_part)
-            return pd.Timedelta(minutes=mins, seconds=secs)
+        if leaks_file.name.endswith('.csv'):
+            df_lds_IV = pd.read_csv(leaks_file)
+        else:
+            df_lds_IV = pd.read_excel(leaks_file)
         
-        df['duration_td'] = df['Event Duration'].apply(parse_duration)
-        df['end_time'] = df['DateTime'] + df['duration_td']
-        return df
-    
-    @st.cache_data
-    def parse_lds(df):
-        df = df.copy()
-        df['DateTime'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'])
-        return df
-    
-    df_pidws = parse_pidws(df_pidws)
-    df_lds = parse_lds(df_lds)
-    
-    # Classification
-    @st.cache_data
-    def classify_pilferage(pidws_df, lds_df, chainage_tol, time_window_hours):
-        classified = []
-        for _, event in pidws_df.iterrows():
-            window_end = event['end_time'] + pd.Timedelta(hours=time_window_hours)
-            mask = (lds_df['DateTime'] > window_end) & \
-                   (np.abs(lds_df['chainage'] - event['chainage']) <= chainage_tol)
-            matches = lds_df[mask].copy()
-            if not matches.empty:
-                matches['linked_event_time'] = event['DateTime']
-                matches['linked_chainage'] = event['chainage']
-                matches['pilferage_score'] = 1 / (1 + (matches['DateTime'] - window_end).dt.total_seconds() / 3600)
-                classified.append(matches)
+        # Ensure datetime columns exist and are parsed
+        for df, dt_col in [(df_manual_digging, 'DateTime'), (df_lds_IV, 'DateTime')]:
+            if dt_col not in df.columns:
+                st.warning(f"No 'DateTime' column found in {dt_col}. Using index as fallback.")
+            else:
+                df[dt_col] = pd.to_datetime(df[dt_col])
         
-        if classified:
-            return pd.concat(classified, ignore_index=True)
-        return pd.DataFrame()
+        return df_manual_digging, df_lds_IV
     
-    with st.spinner("🔍 Classifying pilferage events..."):
-        pilferage_leaks = classify_pilferage(df_pidws, df_lds, chainage_tol, time_window_hours)
+    df_manual_digging, df_lds_IV = load_data(digging_file, leaks_file)
     
-    # Classification summary
-    if not pilferage_leaks.empty:
-        df_lds_classified = df_lds.copy()
-        df_lds_classified['is_pilferage'] = False
-        
-        pilferage_ids = pilferage_leaks[['DateTime', 'chainage']].drop_duplicates()
-        mask_pilferage = df_lds_classified.set_index(['DateTime', 'chainage']).index.isin(
-            pilferage_ids.set_index(['DateTime', 'chainage']).index
-        )
-        df_lds_classified.loc[mask_pilferage, 'is_pilferage'] = True
-        
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total LDS Records", len(df_lds))
-        col2.metric("Pilferage Events", len(pilferage_leaks), delta=f"{len(pilferage_leaks)/len(df_lds)*100:.1f}%")
-        col3.metric("Avg Pilferage Score", f"{pilferage_leaks['pilferage_score'].mean():.3f}")
-        col4.metric("Top Chainage", f"{pilferage_leaks['linked_chainage'].mean():.1f} km")
-    else:
-        st.warning("⚠️ No pilferage events detected with current parameters")
+    st.success(f"✅ Loaded {len(df_manual_digging)} digging events and {len(df_lds_IV)} leak events.")
     
-    st.markdown("---")
-    
-    # Visualizations (2x2 grid matching original)
-    fig = make_subplots(
-        rows=2, cols=2,
-        subplot_titles=('Chainage Distribution', 'Temporal Pattern', 'Leak Size: Pilferage vs Others', 'Leaks Timeline'),
-        specs=[[{"type": "histogram"}, {"type": "xy"}],
-               [{"type": "box"}, {"type": "scatter"}]]
-    )
-    
-    # 1. Chainage distribution
-    fig.add_trace(
-        go.Histogram(x=df_pidws['chainage'], name='PIDWS Digging', opacity=0.7, marker_color='orange'),
-        row=1, col=1
-    )
-    fig.add_trace(
-        go.Histogram(x=df_lds['chainage'], name='LDS Leaks', opacity=0.7, marker_color='blue'),
-        row=1, col=1
-    )
-    if not pilferage_leaks.empty:
-        fig.add_vline(
-            x=pilferage_leaks['linked_chainage'].mean(),
-            line_dash="dash", line_color="red", annotation_text="Pilferage Mean",
-            row=1, col=1
-        )
-    
-    # 2. Time series
-    all_events = pd.concat([
-        df_pidws[['DateTime', 'chainage']].assign(type='Digging'),
-        df_lds[['DateTime', 'chainage']].assign(type='Leak'),
-    ], ignore_index=True)
-    if not pilferage_leaks.empty:
-        all_events = pd.concat([
-            all_events,
-            pilferage_leaks[['DateTime', 'linked_chainage']].rename(columns={'linked_chainage':'chainage'}).assign(type='Pilferage')
-        ], ignore_index=True)
-    
-    time_counts = all_events.groupby([all_events['DateTime'].dt.floor('H'), 'type']).size().unstack(fill_value=0)
-    for col in time_counts.columns:
-        fig.add_trace(
-            go.Scatter(x=time_counts.index, y=time_counts[col], mode='lines', name=col),
-            row=1, col=2
-        )
-    
-    # 3. Leak size boxplot
-    if not pilferage_leaks.empty:
-        box_data = df_lds_classified[['leak size', 'is_pilferage']].copy()
-        box_data['classification'] = box_data['is_pilferage'].map({True: 'Pilferage', False: 'Other'})
-        fig.add_trace(
-            go.Box(x=box_data['classification'], y=box_data['leak size'], name='Leak Size'),
-            row=2, col=1
-        )
-    
-    # 4. Timeline scatter
-    if not pilferage_leaks.empty:
-        colors = ['red' if x else 'blue' for x in df_lds_classified['is_pilferage']]
-        fig.add_trace(
-            go.Scatter(
-                x=df_lds_classified['DateTime'], y=df_lds_classified['chainage'],
-                mode='markers', marker=dict(color=colors, size=6, opacity=0.6),
-                name='Leaks', showlegend=False
-            ),
-            row=2, col=2
-        )
-        fig.add_annotation(
-            text="🔴 Pilferage, 🔵 Other", xref="paper", yref="paper",
-            x=0.05, y=0.95, showarrow=False, row=2, col=2
-        )
-    
-    fig.update_layout(height=800, title_text="Pilferage Detection Analysis", showlegend=True)
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Chainage clusters table
-    st.markdown("### 📍 Top Chainage Clusters")
-    if not pilferage_leaks.empty:
-        clusters = pilferage_leaks.groupby('linked_chainage')['leak size'].agg(['count', 'mean', 'max']).round(1)
-        st.dataframe(clusters, use_container_width=True)
-    
-    # Download buttons
+    # Data preview
     col1, col2 = st.columns(2)
     with col1:
-        csv_buffer = io.StringIO()
-        if not pilferage_leaks.empty:
-            df_lds_classified.to_csv(csv_buffer, index=False)
-            st.download_button(
-                "💾 Download Classified LDS CSV",
-                csv_buffer.getvalue(),
-                "lds_classified.csv",
-                "text/csv"
-            )
+        st.subheader("Digging Events Preview")
+        st.dataframe(df_manual_digging[['DateTime', 'Original_chainage']].head())
     with col2:
-        st.download_button(
-            "📸 Download Report PNG",
-            data="Visualization ready - use browser screenshot tools",
-            file_name="pilferage_report.png"
-        )
+        st.subheader("Leak Events Preview")
+        st.dataframe(df_lds_IV[['DateTime', 'chainage']].head())
     
+    # Get unique chainages
+    digging_chainages = df_manual_digging['Original_chainage'].dropna().unique()
+    leak_chainages = df_lds_IV['chainage'].dropna().unique()
+    all_chainages = np.sort(np.unique(np.concatenate([digging_chainages, leak_chainages])))
+    
+    if unique_chainages_option == "Specific chainage":
+        unique_chainages = [specific_chainage] if specific_chainage in all_chainages else []
+    elif unique_chainages_option == "Top chainages by events":
+        chainage_counts = {}
+        for ch in all_chainages:
+            dig_count = len(df_manual_digging[abs(df_manual_digging['Original_chainage'] - ch) <= tolerance])
+            leak_count = len(df_lds_IV[abs(df_lds_IV['chainage'] - ch) <= tolerance])
+            chainage_counts[ch] = dig_count + leak_count
+        unique_chainages = sorted(chainage_counts, key=chainage_counts.get, reverse=True)[:top_n]
+    else:
+        unique_chainages = all_chainages
+    
+    st.subheader(f"📈 Plots for {len(unique_chainages)} Chainage(s)")
+    
+    # Plotting section
+    for i, target_chainage_val in enumerate(unique_chainages):
+        with st.container():
+            df_digging_filtered = df_manual_digging[abs(df_manual_digging['Original_chainage'] - target_chainage_val) <= tolerance]
+            df_leaks_filtered = df_lds_IV[abs(df_lds_IV['chainage'] - target_chainage_val) <= tolerance]
+            
+            if not df_digging_filtered.empty or not df_leaks_filtered.empty:
+                fig = plt.figure(figsize=(18, 10))
+                
+                if not df_digging_filtered.empty:
+                    plt.scatter(df_digging_filtered['DateTime'], df_digging_filtered['Original_chainage'], 
+                               color='blue', label='Digging Events', marker='o', s=50)
+                
+                if not df_leaks_filtered.empty:
+                    plt.scatter(df_leaks_filtered['DateTime'], df_leaks_filtered['chainage'], 
+                               color='red', label='Leak Events', marker='X', s=80)
+                
+                plt.title(f'Digging vs. Leak Events at Chainage {target_chainage_val:.1f} (Tolerance: {tolerance:.1f} km)')
+                plt.xlabel('Date and Time')
+                plt.ylabel('Chainage (km)')
+                plt.grid(True)
+                plt.legend(title='Event Type', bbox_to_anchor=(1.05, 1), loc='upper left')
+                plt.tight_layout()
+                
+                st.pyplot(fig)
+                plt.close(fig)
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Digging Events", len(df_digging_filtered))
+                with col2:
+                    st.metric("Leak Events", len(df_leaks_filtered))
+                with col3:
+                    st.metric("Total Events", len(df_digging_filtered) + len(df_leaks_filtered))
+                
+                st.markdown("---")
+            else:
+                st.info(f"No events found for chainage {target_chainage_val:.1f} with tolerance {tolerance:.1f} km.")
+    
+    # Download filtered data
+    st.subheader("💾 Export Results")
+    if st.button("Download All Filtered Data"):
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            for ch in unique_chainages[:10]:  # Limit to top 10 for performance
+                df_dig = df_manual_digging[abs(df_manual_digging['Original_chainage'] - ch) <= tolerance]
+                df_leak = df_lds_IV[abs(df_lds_IV['chainage'] - ch) <= tolerance]
+                if not df_dig.empty:
+                    df_dig.to_excel(writer, sheet_name=f'Digging_{ch:.1f}', index=False)
+                if not df_leak.empty:
+                    df_leak.to_excel(writer, sheet_name=f'Leaks_{ch:.1f}', index=False)
+        st.download_button(
+            "Download Excel",
+            output.getvalue(),
+            f"chainage_analysis_tolerance_{tolerance}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 else:
-    st.info("👆 Please upload both PIDWS and LDS Excel files to start analysis")
+    st.warning("👆 Please upload both digging and leak data files to get started.")
+
+st.markdown("---")
+st.markdown("**Deploy Instructions:**")
+st.markdown("- Save as `app.py` and `requirements.txt`")
+st.markdown("- GitHub: Create repo → Add files → Go to Settings → Pages → Deploy from branch")
+st.markdown("- Streamlit Cloud: Connect GitHub repo → Deploy instantly 🛠️")[web:15][web:21][memory:2]
